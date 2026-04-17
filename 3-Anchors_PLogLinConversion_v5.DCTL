@@ -1,0 +1,188 @@
+/*
+    3-Anchor Log-to-Linear Solver  v5
+    Model: linear = A * 10^(B * cv_norm) + C
+
+    Solves A, B, C per-frame via bisection on B,
+    then back-solves A and C analytically.
+
+    WORKFLOW:
+    1. Measure the three CV sliders from your scope/parade
+       on the ColorChecker (or equivalent reference patches)
+    2. Use Stops Coarse to get to the right ballpark exposure
+    3. Use Stops Fine to align midgrey to match your target
+       camera SLog3 (or other log) reference chart
+
+    The combined stops = Stops Coarse + Stops Fine
+    This scales the decoded linear output by 2^(coarse+fine),
+    acting as a global scene exposure trim. All three anchors
+    scale together, so the black level does NOT lift -- the
+    3-anchor black constraint is always respected.
+
+    WHY THIS IS BETTER THAN PLogLin:
+    PLogLin is a 2-parameter model anchored at White + MidGrey.
+    The Black CV is not constrained, so at low stops settings
+    the black clips/lifts when the curve doesn't pass through it.
+    This 3-anchor solver directly forces: Black CV -> lin_black,
+    so there is no black lift regardless of stops setting.
+
+    LINEAR VALUES ARE COMPUTED AUTOMATICALLY from stops + reflectances:
+      White  (CC patch 19) : 0.9131 * 2^stops
+      MidGrey(CC patch 22) : 0.1915 * 2^stops
+      Black  (CC patch 24) : 0.0311 * 2^stops
+
+    FALLBACK: When A is out of range the exponential model is degenerate
+    (e.g. midgrey CV too close to black CV). The solver falls back to a
+    linear mapping between White and Black anchors. MidGrey will be
+    approximate but the image stays usable.
+
+    IDEAL CINEON CV REFERENCE TABLE (470 + 307.6 * log10(lin/0.18)):
+    Stops | White  | MidGrey | Black
+    -5    |  224   |   15    |  clips
+    -4    |  317   |  108    |  clips
+    -3    |  409   |  200    |  clips
+    -2    |  502   |  293    |   51
+    -1    |  594   |  385    |  143
+     0    |  687   |  478    |  236
+    +1    |  780   |  571    |  329
+    +2    |  872   |  663    |  421
+    +3    |  965   |  756    |  514
+    +4    | clips  |  848    |  606
+    +5    | clips  |  941    |  699
+
+    STOPS FINE PRECISION GUIDE (effect on SLog3 at midgrey):
+    0.50 stops = ~64 code values  (half-stop, very visible)
+    0.10 stops = ~13 code values  (noticeable, common trim range)
+    0.05 stops =  ~6 code values  (subtle, fine alignment)
+    0.01 stops =  ~1 code value   (sub-pixel, measurement noise floor)
+*/
+
+// --- Exposure Stops : Coarse (integer) + Fine (float trim) ---
+DEFINE_UI_PARAMS(stops_coarse, Stops Coarse, DCTLUI_SLIDER_INT,   0,    -5,   5,  1)
+DEFINE_UI_PARAMS(stops_fine,   Stops Fine,   DCTLUI_SLIDER_FLOAT, 0.0, -1.0, 1.0, 0.01)
+
+// --- CV Anchors : measured from your scope/parade (0-1023) ---
+// NOTE: Values must be in 10-bit format (0-1023).
+// If from a 12-bit source (0-4095), divide by 4.
+DEFINE_UI_PARAMS(cv_white,  White CV,   DCTLUI_SLIDER_FLOAT, 687.0, 0.0, 1023.0, 0.5)
+DEFINE_UI_PARAMS(cv_mg,     MidGrey CV, DCTLUI_SLIDER_FLOAT, 478.0, 0.0, 1023.0, 0.5)
+DEFINE_UI_PARAMS(cv_black,  Black CV,   DCTLUI_SLIDER_FLOAT, 236.0, 0.0, 1023.0, 0.5)
+
+// --- Direction ---
+DEFINE_UI_PARAMS(to_lin, Log To Linear, DCTLUI_CHECK_BOX, 1)
+
+// -------------------------------------------------------
+// Bisection solver for B
+// Finds B such that:
+// [10^(B*n_w) - 10^(B*n_b)] / [10^(B*n_mg) - 10^(B*n_b)] = R
+// where R = (lin_w - lin_b) / (lin_mg - lin_b)
+// -------------------------------------------------------
+__DEVICE__ float solve_B(float n_w, float n_mg, float n_b, float R, float cv_span)
+{
+    float lo = 1e-6f;
+    float hi = _fminf(500.0f, 10.0f / _fmaxf(cv_span, 0.05f));
+    float B  = 0.0f;
+
+    for (int i = 0; i < 64; i++)
+    {
+        B = (lo + hi) * 0.5f;
+        float pw  = _powf(10.0f, B * n_w);
+        float pmg = _powf(10.0f, B * n_mg);
+        float pb  = _powf(10.0f, B * n_b);
+
+        if (pw > 1e30f || pmg > 1e30f || pb > 1e30f) { hi = B; continue; }
+
+        float denom = pmg - pb;
+        if (_fabs(denom) < 1e-10f) { hi = B; continue; }
+
+        float fB = (pw - pb) / denom - R;
+        if (fB > 0.0f) hi = B;
+        else           lo = B;
+    }
+    return B;
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
+{
+    // --- Combined stops: coarse integer + fine float trim ---
+    float stops    = (float)stops_coarse + stops_fine;
+    float exposure = _powf(2.0f, stops);
+
+    // --- Linear anchors from combined stops ---
+    float lin_white = 0.9131f * exposure;
+    float lin_mg    = 0.1915f * exposure;
+    float lin_black = 0.0311f * exposure;
+
+    // --- Normalize CV anchors to 0-1 ---
+    float n_w  = cv_white / 1023.0f;
+    float n_mg = cv_mg    / 1023.0f;
+    float n_b  = cv_black / 1023.0f;
+    float cv_span = n_w - n_b;
+
+    // Clamp midgrey to valid bounds if mis-entered
+    float n_mg_clamped = _fmaxf(_fminf(n_mg, n_w), n_b);
+
+    // --- Solve B via bisection ---
+    float R = (lin_white - lin_black) / _fmaxf(lin_mg - lin_black, 1e-10f);
+    float B = solve_B(n_w, n_mg_clamped, n_b, R, cv_span);
+
+    // --- Back-solve A and C analytically ---
+    float pw       = _powf(10.0f, B * n_w);
+    float pb       = _powf(10.0f, B * n_b);
+    float denom_AC = pw - pb;
+    if (_fabs(denom_AC) < 1e-10f) denom_AC = 1e-10f;
+
+    float A = (lin_white - lin_black) / denom_AC;
+    float C = lin_black - A * pb;
+
+    // --- Fallback to linear when exponential model is degenerate ---
+    int   use_linear = (A < 0.0f || A > 100.0f);
+    float lin_slope  = 0.0f;
+    float lin_offset = 0.0f;
+    if (use_linear)
+    {
+        lin_slope  = (lin_white - lin_black) / _fmaxf(n_w - n_b, 1e-10f);
+        lin_offset = lin_black - lin_slope * n_b;
+    }
+
+    // --- Apply transform ---
+    float3 rgb = {p_R, p_G, p_B};
+
+    if (to_lin == 1)
+    {
+        if (use_linear)
+        {
+            rgb.x = lin_slope * rgb.x + lin_offset;
+            rgb.y = lin_slope * rgb.y + lin_offset;
+            rgb.z = lin_slope * rgb.z + lin_offset;
+        }
+        else
+        {
+            rgb.x = A * _powf(10.0f, B * rgb.x) + C;
+            rgb.y = A * _powf(10.0f, B * rgb.y) + C;
+            rgb.z = A * _powf(10.0f, B * rgb.z) + C;
+        }
+
+        // Clamp blacks: C is slightly negative by design (3-anchor constraint),
+        // so values below the black anchor can go marginally negative. Clamp here.
+        rgb.x = _fmaxf(rgb.x, 0.0f);
+        rgb.y = _fmaxf(rgb.y, 0.0f);
+        rgb.z = _fmaxf(rgb.z, 0.0f);
+    }
+    else
+    {
+        if (use_linear)
+        {
+            rgb.x = (rgb.x - lin_offset) / _fmaxf(lin_slope, 1e-10f);
+            rgb.y = (rgb.y - lin_offset) / _fmaxf(lin_slope, 1e-10f);
+            rgb.z = (rgb.z - lin_offset) / _fmaxf(lin_slope, 1e-10f);
+        }
+        else
+        {
+            rgb.x = _log10f(_fmaxf((rgb.x - C) / A, 1e-10f)) / B;
+            rgb.y = _log10f(_fmaxf((rgb.y - C) / A, 1e-10f)) / B;
+            rgb.z = _log10f(_fmaxf((rgb.z - C) / A, 1e-10f)) / B;
+        }
+    }
+
+    return rgb;
+}
