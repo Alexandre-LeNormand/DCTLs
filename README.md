@@ -1,4 +1,4 @@
-# 3-Anchors PLogLin Conversion
+# 3 Points Anchors PLogLin Conversion
 
 A DaVinci Resolve DCTL that converts between log and linear using a **3-anchor model** fit to measured code values from a ColorChecker or equivalent reference chart. This DCTL is usefull when working with brackets of multiple exposures of colorcharts shot on film for film emulation purposes. Unlike PLogLin's model, this solver directly constrains all three tonal anchors — White, MidGrey, and Black — eliminating the black lift problem at low exposure settings.
 
